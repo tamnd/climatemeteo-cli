@@ -1,38 +1,54 @@
 // Package climatemeteo is the library behind the climatemeteo command line:
-// the HTTP client, request shaping, and the typed data models for climatemeteo.
+// the HTTP client, request shaping, and the typed data models for the
+// Open-Meteo Climate Change API.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
+// transient failures (429 and 5xx) that any public API throws under load.
 // Build your endpoint calls and JSON decoding on top of it.
 package climatemeteo
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
+	"strconv"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to climatemeteo. A real, honest
+// DefaultUserAgent identifies the client to Open-Meteo. A real, honest
 // User-Agent is both polite and the thing most likely to keep you unblocked.
 const DefaultUserAgent = "climatemeteo/dev (+https://github.com/tamnd/climatemeteo-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at climatemeteo.com; change it once you
-// know the real endpoints you want to read.
-const Host = "climatemeteo.com"
+// Host is the climate API host this client talks to.
+const Host = "climate-api.open-meteo.com"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// Config holds the tunables for a Client.
+type Config struct {
+	BaseURL string
+	Rate    time.Duration
+	Retries int
+	Timeout time.Duration
+}
 
-// Client talks to climatemeteo over HTTP.
+// DefaultConfig returns sensible defaults for the Open-Meteo Climate API.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL: "https://climate-api.open-meteo.com",
+		Rate:    0,
+		Retries: 3,
+		Timeout: 30 * time.Second,
+	}
+}
+
+// Client talks to the Open-Meteo Climate Change API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,21 +56,22 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
 // Get fetches url and returns the response body. It paces and retries according
 // to the client's settings. The caller owns nothing extra; the body is read
 // fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +81,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,12 +90,12 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -123,78 +140,75 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on climatemeteo.com. It is a stand-in for the typed records you
-// will model from the real climatemeteo endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `climatemeteo cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// ClimateDailyForecast is one day of climate projection data.
+type ClimateDailyForecast struct {
+	Time            string  `kit:"id" json:"time"`
+	TemperatureMean float64 `json:"temperature_mean"`
+	PrecipSum       float64 `json:"precip_sum"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// wireClimateResponse is the raw JSON shape returned by the climate API.
+type wireClimateResponse struct {
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+	Daily     struct {
+		Time            []string  `json:"time"`
+		TemperatureMean []float64 `json:"temperature_2m_mean"`
+		PrecipSum       []float64 `json:"precipitation_sum"`
+	} `json:"daily"`
+}
+
+// DailyParams holds the parameters for a daily climate projection request.
+type DailyParams struct {
+	Lat   float64
+	Lon   float64
+	Start string
+	End   string
+	Model string
+}
+
+// Daily fetches daily climate projections for the given parameters.
+func (c *Client) Daily(ctx context.Context, p DailyParams) ([]*ClimateDailyForecast, error) {
+	if p.Start == "" {
+		p.Start = "2030-01-01"
+	}
+	if p.End == "" {
+		p.End = "2030-01-07"
+	}
+	if p.Model == "" {
+		p.Model = "EC_Earth3P_HR"
+	}
+
+	q := url.Values{}
+	q.Set("latitude", strconv.FormatFloat(p.Lat, 'f', -1, 64))
+	q.Set("longitude", strconv.FormatFloat(p.Lon, 'f', -1, 64))
+	q.Set("start_date", p.Start)
+	q.Set("end_date", p.End)
+	q.Set("daily", "temperature_2m_mean,precipitation_sum")
+	q.Set("models", p.Model)
+
+	rawURL := c.BaseURL + "/v1/climate?" + q.Encode()
+	body, err := c.Get(ctx, rawURL)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+	var wire wireClimateResponse
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
+
+	n := len(wire.Daily.Time)
+	out := make([]*ClimateDailyForecast, n)
+	for i := 0; i < n; i++ {
+		row := &ClimateDailyForecast{Time: wire.Daily.Time[i]}
+		if i < len(wire.Daily.TemperatureMean) {
+			row.TemperatureMean = wire.Daily.TemperatureMean[i]
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
+		if i < len(wire.Daily.PrecipSum) {
+			row.PrecipSum = wire.Daily.PrecipSum[i]
 		}
+		out[i] = row
 	}
 	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
